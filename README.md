@@ -119,19 +119,19 @@ tests/test_agent.py::test_agent_self_correction_reflection PASSED        [100%]
 
 ---
 
-## 💡 Technical Interview Talking Points
+## 🏛️ Architectural Decisions & Engineering FAQ
 
-### 1. Why use Model Context Protocol (MCP) instead of hardcoding database tools?
-Hardcoding prompts creates an $M \times N$ integration nightmare where every tool has custom schemas and prompt templates. Anthropic's Model Context Protocol (MCP) establishes a standardized, client-server protocol. The model discovers database tools (`describe_table`, `execute_sql`) through typed JSON schemas and executes them via isolated, standardized interfaces that can connect identically to DuckDB, PostgreSQL, or Snowflake.
+### 1. Why Model Context Protocol (MCP) instead of ad-hoc database tool calling?
+Ad-hoc tool calling creates an $M \times N$ integration bottleneck where every tool requires custom prompt schemas, fragile serialization, and vendor lock-in. Anthropic's Model Context Protocol (MCP) provides an open, standardized client-server protocol. The model discovers warehouse capabilities (`describe_table`, `execute_sql`, `explain_sql`) through typed JSON Schema contracts and interacts with isolated, secure data layers that can connect identically to DuckDB, PostgreSQL, or Snowflake.
 
-### 2. Why LangGraph instead of a linear LangChain chain?
-Real databases return unexpected edge cases: column name mismatches, type coercions, and division-by-zero errors. A linear chain (`Prompt -> Model -> DB`) fails immediately on the first error. LangGraph enables a **cyclical state machine** with conditional edge routing: if `execution_result['success'] == False`, state transitions to a `ReflectionNode` that analyzes the error traceback, adjusts memory, and re-routes back to `SQLGeneratorNode` for self-correction.
+### 2. Why a Cyclical LangGraph StateGraph instead of a linear execution chain?
+Real databases return unexpected runtime edge cases: column name mismatches, subtle dialect nuances, and type coercions. A linear chain (`Prompt -> LLM -> DB`) crashes immediately on the first error. LangGraph enables a **cyclical state machine** with conditional routing: if `execution_result['success'] == False`, the state transitions to a `ReflectionNode` that analyzes the error traceback, inspects schema constraints, adjusts state memory, and re-routes back to `SQLGeneratorNode` for self-correction.
 
-### 3. How do you prevent malicious or high-cost SQL execution?
-We implement a defense-in-depth model:
-1. **Connection-level:** DuckDB instance is instantiated with `read_only=True`.
-2. **AST Guardrail:** `sqlparse` token analysis rejects non-SELECT statements, multi-statement queries, and prohibited keywords (`DROP`, `ALTER`, `TRUNCATE`, `DELETE`, `UPDATE`).
-3. **Execution-level:** Hard statement timeouts (10s) and automatic `LIMIT 100` injection prevent runaway memory exhaustion.
+### 3. How does the architecture enforce security and prevent runaway query execution?
+We implement a three-tier defense-in-depth model:
+1. **Connection-level:** The database engine connection is strictly initialized with `read_only=True`.
+2. **AST Guardrail:** `sqlparse` token analysis parses statement trees to block non-SELECT queries, multi-statement injection vectors, and prohibited DDL/DML keywords (`DROP`, `ALTER`, `TRUNCATE`, `DELETE`, `UPDATE`, `GRANT`).
+3. **Execution-level:** Statement timeouts (10s) and automatic `LIMIT 100` injection prevent runaway memory exhaustion.
 
 ---
 
