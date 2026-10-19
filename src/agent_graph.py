@@ -1,0 +1,298 @@
+"""LangGraph Cyclical State Machine for Autonomous Database Reasoning.
+Orchestrates: Discovery -> SQL Generation -> Execution -> Reflection/Self-Correction -> Synthesis.
+"""
+
+import re
+import json
+import time
+from typing import Dict, Any, List
+
+from src.config import Config
+from src.agent_state import AgentState
+from src.mcp_server import MCPSQLServer
+
+class AutonomousSQLAgent:
+    """Enterprise Database Reasoning Agent using Anthropic Model Context Protocol (MCP)
+    and a cyclical self-correcting StateGraph pattern.
+    """
+
+    def __init__(self, mcp_server: MCPSQLServer = None):
+        self.mcp = mcp_server or MCPSQLServer()
+
+    def run(self, user_query: str) -> AgentState:
+        """Executes the full LangGraph state machine from query to synthesized answer."""
+        state = AgentState(user_query=user_query)
+        self._record_trace(state, "START", f"Received query: '{user_query}'")
+
+        # 1. Schema Discovery Node
+        state = self._schema_discovery_node(state)
+
+        # 2. Main Generation & Self-Correction Loop
+        while state.reflection_count <= Config.MAX_REFLECTION_RETRIES:
+            # Generate SQL
+            state = self._sql_generator_node(state)
+
+            # Execute via MCP
+            state = self._execution_node(state)
+
+            # Conditional Edge Check
+            if state.execution_result and state.execution_result.get("success"):
+                self._record_trace(state, "EXECUTION_SUCCESS", "Query executed cleanly via MCP sandboxed engine.")
+                break
+            else:
+                # Execution Failed -> Self-Correction Loop
+                if state.reflection_count < Config.MAX_REFLECTION_RETRIES:
+                    state = self._reflection_node(state)
+                else:
+                    self._record_trace(state, "MAX_RETRIES_EXCEEDED", "Exhausted reflection retries, proceeding to synthesis.")
+                    break
+
+        # 3. Final Synthesizer Node
+        state = self._synthesizer_node(state)
+        return state
+
+    # ── NODE 1: SCHEMA DISCOVERY ──────────────────────────────────────────────
+    def _schema_discovery_node(self, state: AgentState) -> AgentState:
+        """Discovers available tables and inspects only the schemas relevant to the query."""
+        tables_res = self.mcp.call_tool("list_tables", {})
+        state.available_tables = tables_res.get("tables", [])
+
+        # Heuristic intent mapping to select target tables
+        q_lower = state.user_query.lower()
+        target_tables = set()
+
+        table_keywords = {
+            "accounts": ["account", "company", "acv", "customer", "churn", "health", "tier", "region", "client"],
+            "leads": ["lead", "mql", "sql", "lifecycle", "contact", "conversion", "leakage", "attribution"],
+            "campaigns": ["campaign", "channel", "spend", "budget", "roi", "webinar", "abm", "marketing"],
+            "subscriptions": ["subscription", "mrr", "renew", "plan", "contract", "recurring"]
+        }
+
+        for tbl, kws in table_keywords.items():
+            if any(kw in q_lower for kw in kws):
+                target_tables.add(tbl)
+
+        # Default fallback to primary tables if none matched
+        if not target_tables:
+            target_tables = {"accounts", "leads"}
+
+        for tbl in target_tables:
+            schema_info = self.mcp.call_tool("describe_table", {"table_name": tbl})
+            state.relevant_schemas[tbl] = schema_info
+
+        self._record_trace(
+            state, 
+            "SCHEMA_DISCOVERY", 
+            f"Discovered {len(state.available_tables)} tables. Inspected schemas for: {list(target_tables)}"
+        )
+        return state
+
+    # ── NODE 2: SQL GENERATOR ─────────────────────────────────────────────────
+    def _sql_generator_node(self, state: AgentState) -> AgentState:
+        """Generates SQL using Claude 3.5 Sonnet (or local deterministic engine if offline)."""
+        prompt = self._build_sql_prompt(state)
+
+        if Config.is_anthropic_available():
+            try:
+                import anthropic
+                client = anthropic.Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+                resp = client.messages.create(
+                    model=Config.MODEL_NAME,
+                    max_tokens=Config.MAX_TOKENS,
+                    temperature=Config.TEMPERATURE,
+                    system="You are an expert enterprise SQL systems architect. You output ONLY valid DuckDB/Snowflake SQL. No markdown fences, no conversational text.",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                raw_sql = resp.content[0].text.strip()
+                # Clean any accidental markdown fences
+                clean_sql = re.sub(r"^```sql|^```|```$", "", raw_sql, flags=re.MULTILINE).strip()
+                state.generated_sql = clean_sql
+                state.sql_explanation = f"Generated by {Config.MODEL_NAME} based on inspected MCP schemas."
+            except Exception as e:
+                self._record_trace(state, "LLM_FALLBACK", f"Anthropic API call failed: {e}. Using deterministic engine.")
+                state = self._deterministic_sql_generator(state)
+        else:
+            state = self._deterministic_sql_generator(state)
+
+        self._record_trace(state, "SQL_GENERATED", f"Drafted SQL: {state.generated_sql}")
+        return state
+
+    # ── NODE 3: EXECUTION NODE ────────────────────────────────────────────────
+    def _execution_node(self, state: AgentState) -> AgentState:
+        """Executes candidate SQL through the MCP tool server with safety verification."""
+        if not state.generated_sql:
+            state.error_message = "No SQL statement was generated."
+            state.execution_result = {"success": False, "error": state.error_message}
+            return state
+
+        result = self.mcp.call_tool("execute_sql", {"query": state.generated_sql})
+        state.execution_result = result
+
+        if not result.get("success"):
+            state.error_message = result.get("error")
+            self._record_trace(state, "EXECUTION_ERROR", f"Error encountered: {state.error_message}")
+        else:
+            state.error_message = None
+            self._record_trace(
+                state, 
+                "QUERY_EXECUTED", 
+                f"Returned {result.get('row_count')} rows in {result.get('execution_time_ms')}ms."
+            )
+
+        return state
+
+    # ── NODE 4: REFLECTION & SELF-CORRECTION ───────────────────────────────────
+    def _reflection_node(self, state: AgentState) -> AgentState:
+        """Analyzes database runtime/guardrail error and formulates actionable revision notes."""
+        state.reflection_count += 1
+        err = state.error_message or "Unknown execution error"
+
+        # Diagnose common enterprise SQL errors
+        fix_note = ""
+        if "Referenced column" in err or "Binder Error" in err:
+            fix_note = "Column name mismatch. Re-check schema columns and replace non-existent column with exact schema match."
+        elif "syntax error" in err.lower():
+            fix_note = "SQL syntax dialect error. Simplify joins, ensure correct quotation, and use standard SQL aggregates."
+        elif "Guardrail Violation" in err:
+            fix_note = "Guardrail trip: Ensure query contains strictly a single SELECT statement without forbidden keywords."
+        else:
+            fix_note = f"Database returned error: {err}. Re-structure query to strictly conform to table schema."
+
+        state.reflection_notes.append(f"Iteration {state.reflection_count}: {fix_note} (Raw: {err})")
+        self._record_trace(
+            state, 
+            "REFLECTION_LOOP", 
+            f"Self-Correction Loop #{state.reflection_count}: {fix_note}"
+        )
+        return state
+
+    # ── NODE 5: SYNTHESIZER NODE ──────────────────────────────────────────────
+    def _synthesizer_node(self, state: AgentState) -> AgentState:
+        """Synthesizes query execution output into an executive narrative."""
+        if not state.execution_result or not state.execution_result.get("success"):
+            state.final_answer = (
+                f"### ⚠️ Query Execution Notice\n"
+                f"The autonomous agent attempted to answer: **'{state.user_query}'**, but encountered an unrecoverable database or guardrail issue.\n\n"
+                f"* **Error Reason:** {state.error_message}\n"
+                f"* **Reflection Cycles:** {state.reflection_count} iterations performed.\n"
+                f"* **Last Generated SQL:** `{state.generated_sql}`"
+            )
+            return state
+
+        rows = state.execution_result.get("rows", [])
+        cols = state.execution_result.get("columns", [])
+        time_ms = state.execution_result.get("execution_time_ms", 0.0)
+
+        # Build executive summary
+        summary_lines = [
+            f"### 📊 Executive Data Summary",
+            f"**Query:** {state.user_query}",
+            f"**Execution Performance:** {len(rows)} records retrieved in **{time_ms} ms**.",
+            ""
+        ]
+
+        if not rows:
+            summary_lines.append("*No matching records found in the warehouse for this criteria.*")
+        else:
+            # Highlight top 3 findings
+            summary_lines.append("#### Key Insights:")
+            for i, r in enumerate(rows[:3], start=1):
+                formatted_row = ", ".join(f"**{col}**: {val}" for col, val in zip(cols, r))
+                summary_lines.append(f"{i}. {formatted_row}")
+
+        state.final_answer = "\n".join(summary_lines)
+        self._record_trace(state, "SYNTHESIS_COMPLETE", "Generated executive answer with tabular breakdown.")
+        return state
+
+    # ── HELPER UTILITIES ──────────────────────────────────────────────────────
+    def _record_trace(self, state: AgentState, step: str, detail: str) -> None:
+        state.execution_trace.append({
+            "step": step,
+            "timestamp": time.strftime("%H:%M:%S"),
+            "detail": detail
+        })
+
+    def _build_sql_prompt(self, state: AgentState) -> str:
+        schema_text = ""
+        for tbl, s in state.relevant_schemas.items():
+            cols = [f"{c['column_name']} ({c['data_type']})" for c in s.get("columns", [])]
+            schema_text += f"\nTable: {tbl}\nColumns: {', '.join(cols)}\n"
+
+        prompt = f"""You are generating SQL for DuckDB based on these verified schemas:
+{schema_text}
+
+User Question: {state.user_query}
+"""
+        if state.reflection_notes:
+            prompt += f"\nPrevious Errors & Reflection Notes:\n"
+            for note in state.reflection_notes:
+                prompt += f"- {note}\n"
+            prompt += "\nPlease fix the SQL query to resolve the above error."
+
+        prompt += "\nOutput ONLY valid SQL. No markdown, no commentary."
+        return prompt
+
+    def _deterministic_sql_generator(self, state: AgentState) -> AgentState:
+        """Deterministic SQL Engine for offline evaluation and zero-cost test runs."""
+        q = state.user_query.lower()
+        
+        # Introduce intentional typo on first pass if query asks for "intentional error test"
+        if "test error" in q and state.reflection_count == 0:
+            state.generated_sql = "SELECT invalid_column_name FROM accounts;"
+            state.sql_explanation = "Simulating intentional syntax/schema error to demonstrate self-correction reflection loop."
+            return state
+
+        if "lead leakage" in q or "leakage" in q:
+            state.generated_sql = """
+            SELECT lead_id, contact_name, contact_email, lead_source, lead_score, lifecycle_stage, created_at 
+            FROM leads 
+            WHERE lead_leakage_flag = TRUE 
+            ORDER BY lead_score DESC;
+            """.strip()
+            state.sql_explanation = "Identifies high-score leads (score >= 80) stuck in 'New' stage without sales follow-up."
+        elif "top" in q and ("account" in q or "acv" in q or "revenue" in q):
+            state.generated_sql = """
+            SELECT account_name, tier, industry, annual_contract_value_usd, region, health_score 
+            FROM accounts 
+            WHERE status = 'Active' 
+            ORDER BY annual_contract_value_usd DESC 
+            LIMIT 5;
+            """.strip()
+            state.sql_explanation = "Retrieves top 5 active enterprise accounts by Annual Contract Value."
+        elif "campaign" in q or "roi" in q or "marketing" in q:
+            state.generated_sql = """
+            SELECT campaign_name, channel, allocated_budget_usd, actual_spend_usd, actual_mql_count,
+                   ROUND(actual_spend_usd / NULLIF(actual_mql_count, 0), 2) AS cost_per_mql_usd,
+                   status
+            FROM campaigns 
+            ORDER BY actual_mql_count DESC;
+            """.strip()
+            state.sql_explanation = "Calculates campaign performance, MQL volume, and cost-per-MQL attribution."
+        elif "churn" in q:
+            state.generated_sql = """
+            SELECT tier, COUNT(*) AS churned_count, ROUND(AVG(annual_contract_value_usd), 2) AS avg_lost_acv_usd 
+            FROM accounts 
+            WHERE status = 'Churned' 
+            GROUP BY tier 
+            ORDER BY churned_count DESC;
+            """.strip()
+            state.sql_explanation = "Aggregates churned accounts and financial loss segmented by customer tier."
+        elif "mrr" in q or "subscription" in q:
+            state.generated_sql = """
+            SELECT plan_name, COUNT(*) AS active_subscriptions, ROUND(SUM(mrr_usd), 2) AS total_mrr_usd 
+            FROM subscriptions 
+            GROUP BY plan_name 
+            ORDER BY total_mrr_usd DESC;
+            """.strip()
+            state.sql_explanation = "Computes Monthly Recurring Revenue (MRR) distribution grouped by subscription tier."
+        else:
+            # Fallback general accounts summary
+            state.generated_sql = """
+            SELECT tier, COUNT(*) AS total_accounts, ROUND(SUM(annual_contract_value_usd), 2) AS total_acv_usd, ROUND(AVG(health_score), 1) AS avg_health 
+            FROM accounts 
+            GROUP BY tier 
+            ORDER BY total_acv_usd DESC;
+            """.strip()
+            state.sql_explanation = "General aggregation of enterprise accounts and revenue by tier."
+
+        return state
