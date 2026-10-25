@@ -95,7 +95,7 @@ class AutonomousSQLAgent:
         if Config.is_anthropic_available():
             try:
                 import anthropic
-                client = anthropic.Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+                client = anthropic.Anthropic(api_key=Config.get_anthropic_api_key())
                 resp = client.messages.create(
                     model=Config.MODEL_NAME,
                     max_tokens=Config.MAX_TOKENS,

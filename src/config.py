@@ -13,7 +13,6 @@ class Config:
     DB_PATH = DATA_DIR / "enterprise_warehouse.duckdb"
     
     # Anthropic Claude 3.5 Sonnet
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     MODEL_NAME = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
     MAX_TOKENS = 4096
     TEMPERATURE = 0.0  # Zero temperature for deterministic SQL generation
@@ -24,5 +23,18 @@ class Config:
     MAX_REFLECTION_RETRIES = 3
     
     @classmethod
+    def get_anthropic_api_key(cls) -> str:
+        key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not key:
+            try:
+                import streamlit as st
+                if hasattr(st, "secrets") and "ANTHROPIC_API_KEY" in st.secrets:
+                    key = st.secrets["ANTHROPIC_API_KEY"]
+            except Exception:
+                pass
+        return key
+
+    @classmethod
     def is_anthropic_available(cls) -> bool:
-        return bool(cls.ANTHROPIC_API_KEY and len(cls.ANTHROPIC_API_KEY.strip()) > 10)
+        key = cls.get_anthropic_api_key()
+        return bool(key and len(key.strip()) > 10)
