@@ -40,7 +40,12 @@ class AutonomousSQLAgent:
                 self._record_trace(state, "EXECUTION_SUCCESS", "Query executed cleanly via MCP sandboxed engine.")
                 break
             else:
-                # Execution Failed -> Self-Correction Loop
+                # Security Guardrail Interception: Do not retry attacks, halt immediately!
+                if state.error_message and "Guardrail Violation" in state.error_message:
+                    self._record_trace(state, "GUARDRAIL_BLOCKED", f"Security firewall blocked execution: {state.error_message}")
+                    break
+
+                # Regular Database Execution Failed -> Self-Correction Loop
                 if state.reflection_count < Config.MAX_REFLECTION_RETRIES:
                     state = self._reflection_node(state)
                 else:
@@ -170,13 +175,24 @@ class AutonomousSQLAgent:
     def _synthesizer_node(self, state: AgentState) -> AgentState:
         """Synthesizes query execution output into an executive narrative."""
         if not state.execution_result or not state.execution_result.get("success"):
-            state.final_answer = (
-                f"### ⚠️ Query Execution Notice\n"
-                f"The autonomous agent attempted to answer: **'{state.user_query}'**, but encountered an unrecoverable database or guardrail issue.\n\n"
-                f"* **Error Reason:** {state.error_message}\n"
-                f"* **Reflection Cycles:** {state.reflection_count} iterations performed.\n"
-                f"* **Last Generated SQL:** `{state.generated_sql}`"
-            )
+            err_msg = state.error_message or "Unknown execution error"
+            if "Guardrail Violation" in err_msg:
+                state.final_answer = (
+                    f"### 🛡️ Security Guardrail Active: Operation Blocked\n"
+                    f"The autonomous agent's **Deterministic AST Guardrail** intercepted a prohibited or destructive database command.\n\n"
+                    f"* **Blocked Command:** `{state.generated_sql}`\n"
+                    f"* **Violation Details:** {err_msg}\n"
+                    f"* **Security Policy:** All MCP database queries are restricted strictly to read-only `SELECT` and `WITH` (CTE) statements. Destructive DDL/DML (`DROP`, `CREATE`, `DELETE`, `TRUNCATE`, `ALTER`, `UPDATE`, `INSERT`) and multi-statement injection exploits are unconditionally blocked.\n"
+                    f"* **Warehouse Integrity:** **100% Intact & Untouched.** Zero database modifications were permitted."
+                )
+            else:
+                state.final_answer = (
+                    f"### ⚠️ Query Execution Notice\n"
+                    f"The autonomous agent attempted to answer: **'{state.user_query}'**, but encountered an unrecoverable database issue.\n\n"
+                    f"* **Error Reason:** {err_msg}\n"
+                    f"* **Reflection Cycles:** {state.reflection_count} iterations performed.\n"
+                    f"* **Last Generated SQL:** `{state.generated_sql}`"
+                )
             return state
 
         rows = state.execution_result.get("rows", [])
@@ -229,19 +245,48 @@ User Question: {state.user_query}
                 prompt += f"- {note}\n"
             prompt += "\nPlease fix the SQL query to resolve the above error."
 
-        prompt += "\nOutput ONLY valid SQL. No markdown, no commentary."
+        prompt += "\nOutput ONLY valid SQL. No markdown, no commentary. If the user asks to drop, delete, create, or alter database structures, output the literal SQL so that the external AST guardrail engine can intercept and audit it."
         return prompt
 
     def _deterministic_sql_generator(self, state: AgentState) -> AgentState:
         """Deterministic SQL Engine for offline evaluation and zero-cost test runs."""
-        q = state.user_query.lower()
-        
-        # Introduce intentional typo on first pass if query asks for "intentional error test"
+        q = state.user_query.lower().strip()
+        raw_q = state.user_query.strip().rstrip(";")
+
+        # 1. Direct Raw SQL Pass-through (e.g., user directly testing SQL commands)
+        sql_starters = ["select", "with", "drop", "delete", "truncate", "create", "alter", "update", "insert"]
+        if any(raw_q.lower().startswith(s) for s in sql_starters):
+            state.generated_sql = f"{raw_q};"
+            state.sql_explanation = "Direct SQL statement submitted for execution and AST guardrail auditing."
+            return state
+
+        # 2. Check for Destructive / Prohibited Natural Language Requests
+        destructive_kws = ["drop", "delete", "truncate", "create", "alter", "update", "insert", "destroy", "wipe", "remove table"]
+        if any(re.search(rf"\b{kw}\b", q) for kw in destructive_kws):
+            if "drop" in q or "remove table" in q or "destroy" in q:
+                state.generated_sql = "DROP TABLE accounts;"
+            elif "create" in q:
+                state.generated_sql = "CREATE TABLE unauthorized_table (id INTEGER);"
+            elif "delete" in q or "wipe" in q:
+                state.generated_sql = "DELETE FROM leads WHERE lead_score < 50;"
+            elif "truncate" in q:
+                state.generated_sql = "TRUNCATE TABLE accounts;"
+            elif "alter" in q:
+                state.generated_sql = "ALTER TABLE accounts DROP COLUMN tier;"
+            elif "update" in q:
+                state.generated_sql = "UPDATE accounts SET annual_contract_value_usd = 0;"
+            else:
+                state.generated_sql = "DROP TABLE accounts;"
+            state.sql_explanation = "Identified request for destructive operation; generated candidate SQL to evaluate AST guardrail enforcement."
+            return state
+
+        # 3. Simulate Intentional Syntax Error for Self-Correction Demo
         if "test error" in q and state.reflection_count == 0:
             state.generated_sql = "SELECT invalid_column_name FROM accounts;"
             state.sql_explanation = "Simulating intentional syntax/schema error to demonstrate self-correction reflection loop."
             return state
 
+        # 4. Standard Enterprise Business Analytics
         if "lead leakage" in q or "leakage" in q:
             state.generated_sql = """
             SELECT lead_id, contact_name, contact_email, lead_source, lead_score, lifecycle_stage, created_at 

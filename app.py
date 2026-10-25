@@ -120,10 +120,10 @@ if example_col3.button("📈 Campaign ROI & Cost Per MQL"):
     q_prompt = "Compare marketing campaign performance and calculate cost per MQL across channels"
 if example_col4.button("📉 Churn Analysis by Account Tier"):
     q_prompt = "Analyze churned accounts and financial loss segmented by customer tier"
-if example_col5.button("💰 Monthly Recurring Revenue by Plan"):
-    q_prompt = "Compute Monthly Recurring Revenue (MRR) distribution grouped by subscription tier"
-if example_col6.button("🔁 Trigger Self-Correction Loop"):
+if example_col5.button("🔁 Trigger Reflection Loop (Auto-Repair)"):
     q_prompt = "Run a test error query to evaluate self-correction"
+if example_col6.button("🛡️ Test Security Guardrail (DROP TABLE)"):
+    q_prompt = "DROP TABLE accounts;"
 
 user_query = st.text_input(
     "Natural Language Query",
@@ -150,7 +150,7 @@ if st.session_state.last_state:
     # 1. Executive Summary & KPIs
     st.markdown(state.final_answer)
     
-    # 2. Results Table
+    # 2. Results Table or Security Trace
     if state.execution_result and state.execution_result.get("success"):
         cols = state.execution_result.get("columns", [])
         rows = state.execution_result.get("rows", [])
@@ -183,6 +183,12 @@ if st.session_state.last_state:
             if state.reflection_count > 0:
                 st.warning(f"🔁 Self-Correction Triggered: Completed **{state.reflection_count} reflection cycles** to autonomously recover from database errors.")
     else:
-        st.error(f"Execution Error: {state.error_message}")
-        if state.generated_sql:
-            st.code(state.generated_sql, language="sql")
+        st.error(f"🛑 Execution Intercepted: {state.error_message}")
+        tab_sql, tab_trace = st.tabs(["📝 Blocked Candidate SQL", "🔄 LangGraph Audit Trace"])
+        with tab_sql:
+            st.code(state.generated_sql if state.generated_sql else "-- No SQL generated", language="sql")
+        with tab_trace:
+            st.markdown("#### Intercepted State Machine Trace:")
+            for step in state.execution_trace:
+                with st.expander(f"[{step['timestamp']}] {step['step']}", expanded=True):
+                    st.write(step["detail"])

@@ -59,3 +59,17 @@ def test_agent_self_correction_reflection():
     state = agent.run("Run a test error query to evaluate self-correction")
     assert state.reflection_count >= 1
     assert len(state.reflection_notes) >= 1
+
+def test_agent_blocks_destructive_drop_table():
+    agent = AutonomousSQLAgent()
+    state = agent.run("DROP TABLE accounts;")
+    assert state.execution_result.get("success") is False
+    assert "Guardrail Violation" in state.error_message
+    assert "Security Guardrail Active: Operation Blocked" in state.final_answer
+
+def test_agent_blocks_create_table():
+    agent = AutonomousSQLAgent()
+    state = agent.run("Please create table test_leak (id int)")
+    assert state.execution_result.get("success") is False
+    assert "Guardrail Violation" in state.error_message
+    assert "Security Guardrail Active: Operation Blocked" in state.final_answer
